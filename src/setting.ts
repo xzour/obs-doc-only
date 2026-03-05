@@ -127,7 +127,12 @@ export class MrdocSettingTab extends PluginSettingTab {
 					// 发起 API 请求
 					const response = await requestUrl({url:`${apiUrl}?${queryString}`});
 					if (response.json.status){
-						new Notice("测试连接成功！")
+						// 同步更新当前登录用户名
+						if (response.json.data?.username) {
+							this.plugin.settings.currentUser = response.json.data.username;
+							await this.plugin.saveSettings();
+						}
+						new Notice("测试连接成功！当前用户：" + (response.json.data?.username || '未知'))
 					}
 				  } catch (error) {
 					console.error('Error during API request:', error);
