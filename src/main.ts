@@ -340,8 +340,7 @@ export default class MrdocPlugin extends Plugin {
 				if(serverDoc.status && serverDoc.data.modify_time){
 					const localTime = found.modify_time;
 					const serverTime = String(serverDoc.data.modify_time);
-					if(localTime !== serverTime){
-						// 存在冲突，弹窗确认
+					if(!this.isModifyTimeEqual(localTime, serverTime)){
 						return new Promise<void>((resolve) => {
 							new SyncConfirmModal(this.app, {
 								title: '文档冲突提醒',
@@ -367,6 +366,23 @@ export default class MrdocPlugin extends Plugin {
 		}
 
 		await this.doModify(file);
+	}
+
+	/**
+	 * 比较两个 modify_time 是否表示同一时刻。
+	 * 服务端返回的时间格式可能不一致（"2026-03-06 17:32:02.150985" vs "2026-03-06T17:32:02.150"），
+	 * 先尝试解析为时间戳，容忍 2 秒以内的误差视为相同。
+	 */
+	private isModifyTimeEqual(localTime: string, serverTime: string): boolean {
+		if(localTime === serverTime) return true;
+		try {
+			const localMs = new Date(localTime.replace(' ', 'T')).getTime();
+			const serverMs = new Date(serverTime.replace(' ', 'T')).getTime();
+			if(isNaN(localMs) || isNaN(serverMs)) return false;
+			return Math.abs(localMs - serverMs) < 2000;
+		} catch {
+			return false;
+		}
 	}
 
 	private async doModify(file: TFile | TFolder){
