@@ -1,5 +1,5 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting,TAbstractFile,TFile,TFolder,normalizePath  } from 'obsidian';
-import { MrdocSettingTab, MrdocPluginSettings, DEFAULT_SETTINGS } from './setting';
+import { MrdocSettingTab, MrdocPluginSettings, DEFAULT_SETTINGS, FileMapEntry } from './setting';
 import Helper from "./helper";
 import { MrdocApiReq } from "./api";
 import { PullMrdocModal,LoadingModal,PulledModal,SyncConfirmModal } from "./modals";
@@ -56,6 +56,19 @@ export default class MrdocPlugin extends Plugin {
 					await this.onPullItem(file)
 				  });
 			  });
+			  // 发布/转草稿按钮（仅已映射文档显示）
+			  const found = this.settings.fileMap.find(item => item.path === file.path);
+			  if (found) {
+				const isDraft = found.status === 0;
+				menu.addItem((item) => {
+				  item
+					.setTitle(isDraft ? "发布文档" : "转为草稿")
+					.setIcon(isDraft ? "upload-cloud" : "file-edit")
+					.onClick(async () => {
+					  await this.onToggleDocStatus(file, found);
+					});
+				});
+			  }
 			})
 		  );
 
@@ -183,10 +196,9 @@ export default class MrdocPlugin extends Plugin {
 			const docPath = cleanBasePath ? `${cleanBasePath}/${doc.name}` : doc.name;
 			const docIndexPath = cleanBasePath ? `${cleanBasePath}/${doc.name}/${doc.name}_index` : doc.name;
 			if (doc.sub.length === 0) {// 如果 sub 为空，文档不包含子文档，创建文件
-				// console.log(`创建文件：${docPath}`);
 				await this.createFile(docPath,doc);
 			} else {// 如果 sub 不为空，文档包含子文档，创建文件夹、文件并递归处理 sub
-				await this.createFolder(docPath, doc.id, doc.create_user || ''); // 创建同名文件夹
+				await this.createFolder(docPath, doc.id, doc.create_user || '', doc.status); // 创建同名文件夹
 				await this.createFilesAndFolders(doc.sub, docPath); // 递归子文档
 			}
 		}
@@ -209,12 +221,22 @@ export default class MrdocPlugin extends Plugin {
 
 		if(!mapExits && !fileExits){ // 既不存在文档映射，也不存在本地同名文件，直接新建文件
 			const file = await this.app.vault.create(filePath,docContent.data.md_content)
-			this.settings.fileMap.push({ path: file.path, doc_id: doc.id, creator: doc.create_user || '' });
+			this.settings.fileMap.push({
+				path: file.path,
+				doc_id: doc.id,
+				creator: doc.create_user || '',
+				status: doc.status !== undefined ? doc.status : (docContent.data.status !== undefined ? docContent.data.status : 1),
+				modify_time: docContent.data.modify_time ? String(docContent.data.modify_time) : undefined,
+			});
 			this.saveSettings()
 			let msg = `【已创建】文件：${doc.name}`
 			new Notice(msg)
 			this.pullInfoArray.push(msg)
 		}else if(mapExits){ // 如果存在文档映射
+			// 同步服务端状态到本地映射
+			mapExits.status = doc.status !== undefined ? doc.status : (docContent.data.status !== undefined ? docContent.data.status : mapExits.status);
+			mapExits.modify_time = docContent.data.modify_time ? String(docContent.data.modify_time) : mapExits.modify_time;
+
 			if(fileExits && mapFileExits && fileExits.path != mapFileExits.path){ // 存在本地文件和映射文件，且两者不一致
 				mapExits.path = filePath;
 				this.saveSettings()
@@ -268,35 +290,86 @@ export default class MrdocPlugin extends Plugin {
 	}
 
 	// 创建文件夹
-	private async createFolder(docPath: string, docId: string | number, docCreator: string = ''){
+	private async createFolder(docPath: string, docId: string | number, docCreator: string = '', docStatus?: number){
 		const fileExits = this.app.vault.getAbstractFileByPath(`${docPath}`)
 		if(fileExits){
+			// 更新已有映射的 status
+			const existingMap = this.settings.fileMap.find(item => item.path === docPath);
+			if(existingMap && docStatus !== undefined){
+				existingMap.status = docStatus;
+				this.saveSettings();
+			}
 			new Notice(`【已存在】文件夹：${docPath}`)
 		}else{
 			const file = await this.app.vault.createFolder(`${docPath}`)
-			this.settings.fileMap.push({ path: file.path, doc_id: docId, creator: docCreator });
+			this.settings.fileMap.push({
+				path: file.path,
+				doc_id: docId,
+				creator: docCreator,
+				status: docStatus !== undefined ? docStatus : 1,
+			});
 			this.saveSettings()
 			new Notice(`【已创建】文件夹：${docPath}`)
 		}
 	}
 
-	async toCreate(file: TFile | TFolder){
+	async toCreate(file: TFile | TFolder, isManual: boolean = false){
 		const fileType = this.isFileOrFolder(file)
 		switch(fileType){
 			case "file":
 				let fileExt = file.extension;
 				if(fileExt == 'md'){
-					await this.handleMarkdown(file)
+					await this.handleMarkdown(file, isManual)
 				}else if (fileExt == 'html'){
-					await this.handleHTML(file)
+					await this.handleHTML(file, isManual)
 				}
 				break;
 			case "folder":
-				await this.handleFolder(file)
+				await this.handleFolder(file, isManual)
 		}
 	}
 
 	async toModify(file: TFile | TFolder){
+		const found = this.settings.fileMap.find(item => item.path === file.path);
+		if(!found) return;
+
+		// 冲突检测：对比本地缓存的 modify_time 与服务端当前值
+		if(found.modify_time){
+			try {
+				const serverDoc = await this.req.getDoc({ did: found.doc_id });
+				if(serverDoc.status && serverDoc.data.modify_time){
+					const localTime = found.modify_time;
+					const serverTime = String(serverDoc.data.modify_time);
+					if(localTime !== serverTime){
+						// 存在冲突，弹窗确认
+						return new Promise<void>((resolve) => {
+							new SyncConfirmModal(this.app, {
+								title: '文档冲突提醒',
+								message: `「${file.name}」在 MrDoc 上已被修改（${serverTime}），本地缓存时间为（${localTime}），强制推送将覆盖服务端内容。`,
+								warning: 'MrDoc 保留有历史版本，可在服务端恢复。',
+								confirmText: '强制推送',
+								cancelText: '取消',
+								onConfirm: async () => {
+									await this.doModify(file);
+									resolve();
+								},
+								onCancel: () => {
+									new Notice('已取消推送');
+									resolve();
+								}
+							}).open();
+						});
+					}
+				}
+			} catch(e) {
+				console.warn("冲突检测查询失败，继续推送:", e);
+			}
+		}
+
+		await this.doModify(file);
+	}
+
+	private async doModify(file: TFile | TFolder){
 		const fileType = this.isFileOrFolder(file)
 		switch(fileType){
 			case 'file':
@@ -318,15 +391,13 @@ export default class MrdocPlugin extends Plugin {
 		}
 	}
 
-	// 响应「同步」按钮的点击
+	// 响应「同步」按钮的点击（手动触发）
 	async onSyncItem(file: TFile | TFolder){
-		// console.log("同步文档：",file)
-		// 判断是否存在映射
 		let found = this.settings.fileMap.find(item => item.path === file.path)
-		if(found){ // 如果存在映射，修改文件
+		if(found){
 			this.toModify(file)
-		}else{ // 如果不存在映射，创建文件
-			this.toCreate(file)
+		}else{
+			this.toCreate(file, true)
 		}
 	}
 
@@ -348,11 +419,31 @@ export default class MrdocPlugin extends Plugin {
 			this.settings.pulling = true;
 			await this.saveSettings();
 			await this.app.vault.modify(file, res.data.md_content);
+			found.modify_time = res.data.modify_time ? String(res.data.modify_time) : undefined;
+			found.status = res.data.status !== undefined ? res.data.status : found.status;
 			this.settings.pulling = false;
 			await this.saveSettings();
 			new Notice("已从 MrDoc 拉取更新：" + file.name);
 		}else{
 			new Notice("从 MrDoc 拉取失败：" + res.data);
+		}
+	}
+
+	// 响应「发布文档 / 转为草稿」按钮的点击
+	async onToggleDocStatus(file: TFile | TFolder, found: FileMapEntry){
+		const isDraft = found.status === 0;
+		const action = isDraft ? 'publish' : 'draft';
+		const actionLabel = isDraft ? '发布' : '转为草稿';
+		const res = await this.req.toggleDocStatus({ did: found.doc_id, action });
+		if(res.status){
+			found.status = res.doc_status !== undefined ? res.doc_status : (isDraft ? 1 : 0);
+			if(res.modify_time){
+				found.modify_time = String(res.modify_time);
+			}
+			await this.saveSettings();
+			new Notice(`文档已${actionLabel}：${file.name}`);
+		}else{
+			new Notice(`文档${actionLabel}失败：${res.data || '未知错误'}`);
 		}
 	}
 
@@ -362,11 +453,11 @@ export default class MrdocPlugin extends Plugin {
 		return found.creator !== this.settings.currentUser;
 	}
 
-	// 侦听文档的创建
+	// 侦听文档的创建（自动事件触发，非手动）
 	async onVaultCreate(file: TFile | TFolder) {
 		if(this.settings.pulling) return;
 		if(this.settings.syncMode === 'manual') return;
-		this.toCreate(file)
+		this.toCreate(file, false)
 	}
 
 	// 侦听文档的修改
@@ -393,31 +484,14 @@ export default class MrdocPlugin extends Plugin {
 		this.toModify(file)
 	}
 
-	// 侦听文档的重命名
+	// 侦听文档的重命名（仅更新本地映射路径，不自动同步层级到服务端）
 	async onVaultRename(file: TFile | TFolder, oldPath: string) {
 		if(this.settings.pulling) return;
 		let found = this.settings.fileMap.find(item => item.path === oldPath);
 		if(!found) return;
 
-		// 始终更新本地映射（否则映射会断裂）
 		found.path = file.path;
 		this.saveSettings();
-
-		if(this.settings.syncMode === 'manual') return;
-
-		if(this.settings.syncMode === 'collaborative' && this.isOtherUserDoc(found)) {
-			new SyncConfirmModal(this.app, {
-				title: '确认重命名他人文档',
-				message: `「${file.name}」由 ${found.creator} 创建，是否同步重命名到 MrDoc？`,
-				confirmText: '确认同步',
-				cancelText: '仅本地重命名',
-				onConfirm: () => this.onVaultModify(file),
-				onCancel: () => {}
-			}).open();
-			return;
-		}
-
-		this.onVaultModify(file);
 	}
 
 	// 侦听文档的删除
@@ -811,7 +885,7 @@ export default class MrdocPlugin extends Plugin {
 	}
 
 	// 创建 Markdown 文件文档
-	async handleMarkdown(file: TFile) {
+	async handleMarkdown(file: TFile, isManual: boolean = false) {
 		let oldContent = await this.app.vault.cachedRead(file);
     	let newContent = oldContent;
 		let parentValue = await this.getFileParent(file);
@@ -826,50 +900,61 @@ export default class MrdocPlugin extends Plugin {
 			}
 		}
 
-		let doc = {
+		let doc: any = {
 		  pid: this.settings.defaultProject,
 		  title: file.basename,
 		  editor_mode: 1,
 		  doc: newContent,
 		  parent_doc: parentValue,
+		  status: isManual ? 1 : 0,
 		};
 		return this.handleDocument(file, doc);
 	  }
 	
 	  // 创建 HTML 文件文档
-	  async handleHTML(file: TFile) {
+	  async handleHTML(file: TFile, isManual: boolean = false) {
 		let content = await this.app.vault.cachedRead(file)
 		let parentValue = await this.getFileParent(file);
-		let doc = {
+		let doc: any = {
 		  pid: this.settings.defaultProject,
 		  title: file.basename,
 		  editor_mode: 3,
 		  doc: content,
 		  parent_doc: parentValue,
+		  status: isManual ? 1 : 0,
 		};
 		return this.handleDocument(file, doc);
 	  }
 
 	  // 创建文件夹文档
-	async handleFolder(file:TFile | TFolder) {
+	async handleFolder(file:TFile | TFolder, isManual: boolean = false) {
 		let parentValue = await this.getFileParent(file);
-		let doc = {
+		let doc: any = {
 		  pid: this.settings.defaultProject,
 		  title: file.name,
 		  editor_mode: 1,
 		  doc: '',
 		  parent_doc: parentValue,
+		  status: isManual ? 1 : 0,
 		};
 		return this.handleDocument(file, doc);
 	  }
 	
 	  // 创建文档
-	  async handleDocument(file: TFile | TFolder, doc:any) {
+	  async handleDocument(file: TFile | TFolder, doc: any) {
 		const res = await this.req.createDoc(doc);
 		if (res.status) {
-		  this.settings.fileMap.push({ path: file.path, doc_id: res.data, creator: this.settings.currentUser });
+		  const docStatus = doc.status !== undefined ? doc.status : 1;
+		  this.settings.fileMap.push({
+			path: file.path,
+			doc_id: res.data,
+			creator: this.settings.currentUser,
+			status: docStatus,
+			modify_time: res.modify_time ? String(res.modify_time) : undefined,
+		  });
 		  this.saveSettings();
-		  new Notice("文档" + doc.title + "已同步至MrDoc！");
+		  const statusLabel = docStatus === 0 ? '（草稿）' : '';
+		  new Notice("文档" + doc.title + "已同步至MrDoc！" + statusLabel);
 		} else {
 		  new Notice("文档同步至MrDoc失败！");
 		}
@@ -929,6 +1014,14 @@ export default class MrdocPlugin extends Plugin {
 	  async handleModify(doc:any){
 		const res = await this.req.modifyDoc(doc)
 		if(res.status){
+			// 更新 fileMap 中的 modify_time
+			if(res.modify_time){
+				const found = this.settings.fileMap.find(item => item.doc_id === doc.did);
+				if(found){
+					found.modify_time = String(res.modify_time);
+					await this.saveSettings();
+				}
+			}
 			let formattedTime = this.formatCurrentTime()
 			this.statusBar.setText(`同步于：${formattedTime}`)
 			if(this.settings.syncMode === 'manual'){

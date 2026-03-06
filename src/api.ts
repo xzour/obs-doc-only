@@ -86,6 +86,11 @@ export class MrdocApiReq{
         return this.sendRequest('delete_doc', doc);
     }
 
+    // 切换文档发布/草稿状态
+    async toggleDocStatus(doc: { did: number | string; action: 'publish' | 'draft' }): Promise<any> {
+        return this.sendRequest('toggle_doc_status', doc);
+    }
+
     // 验证Token并获取当前用户信息
     async checkToken(): Promise<any> {
         return this.sendRequest('check_token', {}, 'get');

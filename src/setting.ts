@@ -9,6 +9,8 @@ export interface FileMapEntry {
 	path: string;
 	doc_id: number | string;
 	creator?: string;
+	status?: number;
+	modify_time?: string;
 }
 
 export interface MrdocPluginSettings {
@@ -35,7 +37,7 @@ export const DEFAULT_SETTINGS: MrdocPluginSettings = {
 	projects: [],
 	defaultProject: '',
 	fileMap: [],
-	syncMode: 'collaborative',
+	syncMode: 'manual',
 	currentUser: '',
 	pulling: false,
 	pushing: false
