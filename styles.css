@@ -14,3 +14,74 @@ If your plugin does not need CSS, delete this file.
     overflow-y: auto;
     margin-bottom: 10px;
 }
+
+/* ==========================================================================
+   推送相关样式
+   ========================================================================== */
+
+/* 当前正在处理项的提示文本 */
+.mrdoc-push-current{
+    color: var(--text-muted);
+    font-size: 0.95em;
+    margin: 8px 0;
+    word-break: break-all;
+}
+
+/* 进度条外层 */
+.mrdoc-push-progress-wrap{
+    width: 100%;
+    height: 10px;
+    background-color: var(--background-modifier-border);
+    border-radius: 6px;
+    overflow: hidden;
+    margin: 6px 0 12px 0;
+}
+
+/* 进度条已完成区段 */
+.mrdoc-push-progress-fill{
+    height: 100%;
+    width: 0%;
+    background-color: var(--interactive-accent);
+    transition: width 0.2s ease-in-out;
+}
+
+/* 统计文本 */
+.mrdoc-push-stats{
+    margin: 6px 0 14px 0;
+    font-weight: 600;
+}
+
+/* 实时日志容器 */
+.mrdoc-push-log{
+    max-height: 220px;
+    overflow-y: auto;
+    background-color: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: var(--font-monospace);
+    font-size: 0.85em;
+    line-height: 1.5;
+}
+.mrdoc-push-log > div{
+    padding: 1px 0;
+    word-break: break-all;
+}
+
+/* 推送结果汇总条 */
+.mrdoc-pushed-summary{
+    color: var(--text-muted);
+    margin-top: -8px;
+    margin-bottom: 12px;
+}
+
+/* 推送结果列表条目 */
+.mrdoc-pushed-line-success{
+    color: var(--text-normal);
+}
+.mrdoc-pushed-line-failed{
+    color: var(--text-error, #d33);
+}
+.mrdoc-pushed-line-skipped{
+    color: var(--text-muted);
+}

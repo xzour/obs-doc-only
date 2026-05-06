@@ -2,9 +2,27 @@ import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Set
 import { MrdocSettingTab, MrdocPluginSettings, DEFAULT_SETTINGS, FileMapEntry } from './setting';
 import Helper from "./helper";
 import { MrdocApiReq } from "./api";
-import { PullMrdocModal,LoadingModal,PulledModal,SyncConfirmModal } from "./modals";
+import {
+	PullMrdocModal,
+	LoadingModal,
+	PulledModal,
+	SyncConfirmModal,
+	PushMrdocModal,
+	PushProgressModal,
+	PushedModal,
+	PushedDetail,
+	PushOptions,
+	PushStats,
+} from "./modals";
 import { imgFileToBase64,processMrdocUrl } from './utils';
 import { imageExtension } from "./extension/imageExtension";
+
+// 单项推送的内部结果，用于批量推送结果聚合
+interface PushItemResult {
+	level: 'success' | 'failed' | 'skipped';
+	action: 'created' | 'updated' | 'skipped' | 'failed';
+	message: string;
+}
 
 // 实例化一个插件
 export default class MrdocPlugin extends Plugin {
@@ -72,7 +90,10 @@ export default class MrdocPlugin extends Plugin {
 			})
 		  );
 
-		// 左侧功能区 - 推送图标
+		// 左侧功能区 - 推送图标（本地 → MrDoc 全量/增量推送）
+		const pushIconEl = this.addRibbonIcon('upload-cloud', '推送本地文档到 MrDoc', (evt: MouseEvent) => {
+			this.showPushModal()
+		});
 
 		// 左侧功能区 - 拉取图标
 		const pullIconEl = this.addRibbonIcon('file-down', '拉取 MrDoc 文档到本地', (evt: MouseEvent) => {
@@ -472,6 +493,7 @@ export default class MrdocPlugin extends Plugin {
 	// 侦听文档的创建（自动事件触发，非手动）
 	async onVaultCreate(file: TFile | TFolder) {
 		if(this.settings.pulling) return;
+		if(this.settings.pushing) return;
 		if(this.settings.syncMode === 'manual') return;
 		this.toCreate(file, false)
 	}
@@ -479,6 +501,7 @@ export default class MrdocPlugin extends Plugin {
 	// 侦听文档的修改
 	async onVaultModify(file: TFile | TFolder) {
 		if(this.settings.pulling) return;
+		if(this.settings.pushing) return;
 		if(this.settings.syncMode === 'manual') return;
 
 		if(this.settings.syncMode === 'collaborative') {
@@ -503,6 +526,7 @@ export default class MrdocPlugin extends Plugin {
 	// 侦听文档的重命名（仅更新本地映射路径，不自动同步层级到服务端）
 	async onVaultRename(file: TFile | TFolder, oldPath: string) {
 		if(this.settings.pulling) return;
+		if(this.settings.pushing) return;
 		let found = this.settings.fileMap.find(item => item.path === oldPath);
 		if(!found) return;
 
@@ -513,6 +537,7 @@ export default class MrdocPlugin extends Plugin {
 	// 侦听文档的删除
 	async onVaultDelete(file: TFile | TFolder) {
 		if(this.settings.pulling) return;
+		if(this.settings.pushing) return;
 
 		let found = this.settings.fileMap.find(item => item.path === file.path);
 		if(!found) return;
@@ -1125,4 +1150,366 @@ export default class MrdocPlugin extends Plugin {
 		});
 		modal.open();
     }
+
+	// ======================================================================
+	// 推送本地文档到 MrDoc（批量）
+	// ======================================================================
+
+	// 显示推送确认模态框
+	private async showPushModal() {
+		if (!this.settings.mrdocUrl || !this.settings.mrdocToken) {
+			new Notice("请先在设置中填写 MrDoc URL 与用户 Token");
+			return;
+		}
+		if (!this.settings.defaultProject) {
+			new Notice("请先在设置中选择一个目标文集");
+			return;
+		}
+
+		const modal = new PushMrdocModal(this.app, async (options) => {
+			await this.pushMrDoc(options);
+		});
+		modal.open();
+	}
+
+	// 推送本地 Vault 中的全部文档（按所选模式过滤）
+	async pushMrDoc(options: PushOptions): Promise<void> {
+		// 收集所有可推送的节点（深度优先：父先于子）
+		const nodes = this.collectPushableNodes();
+
+		const stats: PushStats = {
+			total: nodes.length,
+			processed: 0,
+			created: 0,
+			updated: 0,
+			skipped: 0,
+			failed: 0,
+		};
+		const details: PushedDetail[] = [];
+
+		if (stats.total === 0) {
+			new Notice("当前 Vault 没有可推送的文档（仅支持 .md / .html 文件与文件夹）");
+			return;
+		}
+
+		// 打开进度模态框
+		const progressModal = new PushProgressModal(this.app);
+		progressModal.open();
+		progressModal.updateStats(stats);
+
+		// 标记推送中：避免事件回环
+		this.settings.pushing = true;
+		await this.saveSettings();
+
+		try {
+			for (const node of nodes) {
+				progressModal.setCurrent(`正在处理：${this.describeNode(node)}`);
+
+				let result: PushItemResult;
+				try {
+					result = await this.batchPushNode(node, options);
+				} catch (e: any) {
+					console.error("批量推送节点异常：", node.path, e);
+					result = {
+						level: 'failed',
+						action: 'failed',
+						message: `【异常】${this.describeNode(node)}：${e?.message || e}`,
+					};
+				}
+
+				stats.processed += 1;
+				switch (result.action) {
+					case 'created':
+						stats.created += 1;
+						break;
+					case 'updated':
+						stats.updated += 1;
+						break;
+					case 'skipped':
+						stats.skipped += 1;
+						break;
+					case 'failed':
+						stats.failed += 1;
+						break;
+				}
+
+				details.push({ level: result.level, text: result.message });
+				progressModal.appendLog(result.message);
+				progressModal.updateStats(stats);
+			}
+		} finally {
+			this.settings.pushing = false;
+			await this.saveSettings();
+
+			progressModal.setHeader("推送已完成");
+			progressModal.setCurrent("即将展示结果汇总…");
+			// 短暂停留以便用户看到最终统计
+			await new Promise((resolve) => window.setTimeout(resolve, 300));
+			progressModal.close();
+		}
+
+		// 展示结果
+		const pushedModal = new PushedModal(this.app, details, stats);
+		pushedModal.open();
+
+		// 顶部状态栏显示同步时间
+		if (this.statusBar) {
+			this.statusBar.setText(`推送于：${this.formatCurrentTime()}`);
+		}
+	}
+
+	// 收集 Vault 中所有可推送的节点（文件夹 + .md/.html 文件），按父先子后顺序返回
+	private collectPushableNodes(): Array<TFile | TFolder> {
+		const result: Array<TFile | TFolder> = [];
+		const root = this.app.vault.getRoot();
+		this.collectChildrenRecursive(root, result);
+		return result;
+	}
+
+	private collectChildrenRecursive(folder: TFolder, result: Array<TFile | TFolder>): void {
+		// 先处理子文件夹（父优先入列）
+		const subFolders: TFolder[] = [];
+		const files: TFile[] = [];
+		for (const child of folder.children) {
+			if (child instanceof TFolder) {
+				subFolders.push(child);
+			} else if (child instanceof TFile) {
+				const ext = child.extension.toLowerCase();
+				if (ext === 'md' || ext === 'html') {
+					files.push(child);
+				}
+			}
+		}
+
+		// 当前层级的文件夹先入列，并立即递归其子节点
+		for (const sub of subFolders) {
+			result.push(sub);
+			this.collectChildrenRecursive(sub, result);
+		}
+
+		// 该层级的文件最后入列（确保所有可能的父文件夹已先入列处理）
+		for (const file of files) {
+			result.push(file);
+		}
+	}
+
+	// 描述一个节点（用于日志/UI）
+	private describeNode(node: TFile | TFolder): string {
+		if (node instanceof TFolder) {
+			return `文件夹「${node.path}」`;
+		}
+		return `文档「${node.path}」`;
+	}
+
+	// 单节点批量推送：根据映射状态与模式决定创建/更新/跳过
+	private async batchPushNode(node: TFile | TFolder, options: PushOptions): Promise<PushItemResult> {
+		const found = this.settings.fileMap.find((m) => m.path === node.path);
+
+		if (found) {
+			// 已映射
+			if (options.mode === 'create-only') {
+				return {
+					level: 'skipped',
+					action: 'skipped',
+					message: `【跳过】${this.describeNode(node)}：已映射，按模式跳过`,
+				};
+			}
+			// full / update-only
+			if (node instanceof TFolder) {
+				return await this.batchUpdateFolder(node, found);
+			}
+			return await this.batchUpdateFile(node, found);
+		}
+
+		// 未映射
+		if (options.mode === 'update-only') {
+			return {
+				level: 'skipped',
+				action: 'skipped',
+				message: `【跳过】${this.describeNode(node)}：未映射，按模式跳过`,
+			};
+		}
+		// full / create-only
+		if (node instanceof TFolder) {
+			return await this.batchCreateFolder(node, options);
+		}
+		return await this.batchCreateFile(node, options);
+	}
+
+	// 批量创建：文件
+	private async batchCreateFile(file: TFile, options: PushOptions): Promise<PushItemResult> {
+		const ext = file.extension.toLowerCase();
+
+		// 读取并处理内容（按现有规则只对 md 转存资源）
+		let oldContent = await this.app.vault.cachedRead(file);
+		let newContent = oldContent;
+		if (ext === 'md' && this.settings.saveImg) {
+			try {
+				newContent = await this.processAssets(oldContent, file);
+				if (oldContent !== newContent) {
+					await this.app.vault.modify(file, newContent);
+				}
+			} catch (e) {
+				console.warn("批量创建：资源转存失败，将以原始内容继续推送：", file.path, e);
+				newContent = oldContent;
+			}
+		}
+
+		const parentValue = await this.getFileParent(file);
+		const editorMode = ext === 'html' ? 3 : 1;
+		const status = options.includeDrafts ? 0 : 1;
+
+		const doc: any = {
+			pid: this.settings.defaultProject,
+			title: file.basename,
+			editor_mode: editorMode,
+			doc: ext === 'html' ? oldContent : newContent,
+			parent_doc: parentValue,
+			status,
+		};
+
+		const res = await this.req.createDoc(doc);
+		if (res && res.status) {
+			this.settings.fileMap.push({
+				path: file.path,
+				doc_id: res.data,
+				creator: this.settings.currentUser,
+				status,
+				modify_time: res.modify_time ? String(res.modify_time) : undefined,
+			});
+			await this.saveSettings();
+			const statusLabel = status === 0 ? '（草稿）' : '';
+			return {
+				level: 'success',
+				action: 'created',
+				message: `【已创建】${this.describeNode(file)}${statusLabel}`,
+			};
+		}
+
+		return {
+			level: 'failed',
+			action: 'failed',
+			message: `【创建失败】${this.describeNode(file)}：${res?.data || '未知错误'}`,
+		};
+	}
+
+	// 批量创建：文件夹
+	private async batchCreateFolder(folder: TFolder, options: PushOptions): Promise<PushItemResult> {
+		const parentValue = await this.getFileParent(folder);
+		const status = options.includeDrafts ? 0 : 1;
+
+		const doc: any = {
+			pid: this.settings.defaultProject,
+			title: folder.name,
+			editor_mode: 1,
+			doc: '',
+			parent_doc: parentValue,
+			status,
+		};
+
+		const res = await this.req.createDoc(doc);
+		if (res && res.status) {
+			this.settings.fileMap.push({
+				path: folder.path,
+				doc_id: res.data,
+				creator: this.settings.currentUser,
+				status,
+				modify_time: res.modify_time ? String(res.modify_time) : undefined,
+			});
+			await this.saveSettings();
+			const statusLabel = status === 0 ? '（草稿）' : '';
+			return {
+				level: 'success',
+				action: 'created',
+				message: `【已创建】${this.describeNode(folder)}${statusLabel}`,
+			};
+		}
+
+		return {
+			level: 'failed',
+			action: 'failed',
+			message: `【创建失败】${this.describeNode(folder)}：${res?.data || '未知错误'}`,
+		};
+	}
+
+	// 批量更新：文件（强制覆盖远程内容，跳过冲突检测）
+	private async batchUpdateFile(file: TFile, found: FileMapEntry): Promise<PushItemResult> {
+		const ext = file.extension.toLowerCase();
+
+		let oldContent = await this.app.vault.cachedRead(file);
+		let newContent = oldContent;
+		if (ext === 'md' && this.settings.saveImg) {
+			try {
+				newContent = await this.processAssets(oldContent, file);
+				if (oldContent !== newContent) {
+					await this.app.vault.modify(file, newContent);
+				}
+			} catch (e) {
+				console.warn("批量更新：资源转存失败，将以原始内容继续推送：", file.path, e);
+				newContent = oldContent;
+			}
+		}
+
+		const parentValue = await this.getFileParent(file);
+		const doc: any = {
+			pid: this.settings.defaultProject,
+			did: found.doc_id,
+			title: file.basename,
+			doc: ext === 'html' ? oldContent : newContent,
+			parent_doc: parentValue,
+		};
+
+		const res = await this.req.modifyDoc(doc);
+		if (res && res.status) {
+			if (res.modify_time) {
+				found.modify_time = String(res.modify_time);
+			}
+			// 更新映射中的路径（容错：即便 path 没变也无影响）
+			found.path = file.path;
+			await this.saveSettings();
+			return {
+				level: 'success',
+				action: 'updated',
+				message: `【已更新】${this.describeNode(file)}`,
+			};
+		}
+
+		return {
+			level: 'failed',
+			action: 'failed',
+			message: `【更新失败】${this.describeNode(file)}：${res?.data || '未知错误'}`,
+		};
+	}
+
+	// 批量更新：文件夹
+	private async batchUpdateFolder(folder: TFolder, found: FileMapEntry): Promise<PushItemResult> {
+		const parentValue = await this.getFileParent(folder);
+		const doc: any = {
+			pid: this.settings.defaultProject,
+			did: found.doc_id,
+			title: folder.name,
+			doc: '',
+			parent_doc: parentValue,
+		};
+
+		const res = await this.req.modifyDoc(doc);
+		if (res && res.status) {
+			if (res.modify_time) {
+				found.modify_time = String(res.modify_time);
+			}
+			found.path = folder.path;
+			await this.saveSettings();
+			return {
+				level: 'success',
+				action: 'updated',
+				message: `【已更新】${this.describeNode(folder)}`,
+			};
+		}
+
+		return {
+			level: 'failed',
+			action: 'failed',
+			message: `【更新失败】${this.describeNode(folder)}：${res?.data || '未知错误'}`,
+		};
+	}
 }
